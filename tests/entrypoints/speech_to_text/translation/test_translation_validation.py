@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import difflib
 import io
 
 # imports for structured outputs tests
@@ -11,6 +12,7 @@ import numpy as np
 import openai
 import pytest
 import pytest_asyncio
+import regex as re
 import soundfile as sf
 
 from tests.entrypoints.speech_to_text.conftest import add_attention_backend
@@ -86,7 +88,7 @@ async def client_and_model(server):
 @pytest.mark.asyncio
 async def test_non_asr_model(foscolo):
     # text to text model
-    model_name = "JackFram/llama-68m"
+    model_name = "vllm-project/llama-68m"
     attention_config = _get_rocm_attention_config(model_name)
     with RemoteOpenAIServer(
         model_name, _get_server_args(attention_config)
@@ -140,6 +142,68 @@ async def test_basic_audio_with_lora(mary_had_lamb):
     assert "pequeño" in out.split(" ")
 
 
+@pytest.mark.asyncio
+async def test_canary_translation(mary_had_lamb):
+    """Canary cannot detect the audio's language and only translates to or
+    from English, so requests it cannot serve must fail instead of returning
+    wrong text."""
+    # NOTE - like the LoRA test above, run before the module scoped server.
+    # Canary has cross-attention, which ROCM_AITER_FA does not support, so
+    # keep the platform default backend.
+    model_name = "nvidia/canary-1b-v2"
+    with RemoteOpenAIServer(model_name, SERVER_ARGS) as remote_server:
+        client = remote_server.get_async_client()
+        translation = await client.audio.translations.create(
+            model=model_name,
+            file=mary_had_lamb,
+            extra_body=dict(language="en", to_language="de"),
+            response_format="text",
+            temperature=0.0,
+        )
+        out = json.loads(translation)["text"].strip().lower()
+        assert "kleines lamm" in out
+
+        mary_had_lamb.seek(0)
+        with pytest.raises(
+            openai.BadRequestError, match="cannot detect the audio's language"
+        ):
+            await client.audio.transcriptions.create(
+                model=model_name, file=mary_had_lamb, temperature=0.0
+            )
+
+        for extra_body, match in [
+            (None, "cannot detect the audio's language"),
+            (dict(language="de", to_language="fr"), "to or from English only"),
+        ]:
+            mary_had_lamb.seek(0)
+            with pytest.raises(openai.BadRequestError, match=match):
+                await client.audio.translations.create(
+                    model=model_name,
+                    file=mary_had_lamb,
+                    extra_body=extra_body,
+                    temperature=0.0,
+                )
+
+
+@pytest.mark.asyncio
+async def test_transcription_only_model_rejects_translation(mary_had_lamb):
+    """A model that cannot translate must not return a transcript as a translation."""
+    # NOTE - like the LoRA test above, run before the module scoped server.
+    model_name = "zai-org/GLM-ASR-Nano-2512"
+    attention_config = _get_rocm_attention_config(model_name)
+    with RemoteOpenAIServer(
+        model_name, _get_server_args(attention_config)
+    ) as remote_server:
+        client = remote_server.get_async_client()
+        with pytest.raises(openai.BadRequestError, match="only supports"):
+            await client.audio.translations.create(
+                model=model_name,
+                file=mary_had_lamb,
+                extra_body=dict(language="en", to_language="de"),
+                temperature=0.0,
+            )
+
+
 # NOTE: (NickLucche) the large-v3-turbo model was not trained on translation!
 @pytest.mark.asyncio
 async def test_basic_audio(foscolo, client_and_model):
@@ -154,6 +218,31 @@ async def test_basic_audio(foscolo, client_and_model):
     )
     out = json.loads(translation)["text"].strip().lower()
     assert "greek sea" in out
+
+
+# NOTE: `foscolo` is not used here: Whisper in translate mode emits no closing
+# timestamp for it, so verbose_json/srt/vtt all yield zero segments (see #58029).
+@pytest.mark.asyncio
+async def test_audio_srt_format(mary_had_lamb, client_and_model):
+    client, model_name = client_and_model
+    request = dict(
+        model=model_name,
+        file=mary_had_lamb,
+        response_format="srt",
+        extra_body=dict(language="en", to_language="en"),
+        temperature=0.0,
+    )
+    if "whisper" not in model_name.lower():
+        # srt/vtt need segment timestamps, which only Whisper-style models emit
+        with pytest.raises(openai.BadRequestError):
+            await client.audio.translations.create(**request)
+        return
+    translation = await client.audio.translations.create(**request)
+    assert translation.startswith("1\n")
+    assert re.search(
+        r"\d{2}:\d{2}:\d{2},\d{3} --> \d{2}:\d{2}:\d{2},\d{3}", translation
+    )
+    assert "lamb" in translation.lower()
 
 
 @pytest.mark.asyncio
@@ -199,7 +288,7 @@ async def test_streaming_response(foscolo, client_and_model, server):
         "seed": 42,
     }
     foscolo.seek(0)
-    async with httpx.AsyncClient() as http_client:
+    async with httpx.AsyncClient(timeout=30) as http_client:
         files = {"file": foscolo}
         async with http_client.stream(
             "POST", url, headers=headers, data=data, files=files
@@ -218,11 +307,12 @@ async def test_streaming_response(foscolo, client_and_model, server):
     res_stream = translation.split()
     # NOTE There's a small non-deterministic issue here, likely in the attn
     # computation, which will cause a few tokens to be different, while still
-    # being very close semantically.
-    assert (
-        sum([x == y for x, y in zip(res_stream, res_no_stream.text.split())])
-        >= len(res_stream) * 0.87
+    # being very close semantically. Align the words rather than compare them
+    # by position: one inserted or dropped word must not shift the rest.
+    matcher = difflib.SequenceMatcher(
+        None, res_stream, res_no_stream.text.split(), autojunk=False
     )
+    assert matcher.ratio() >= 0.87, (translation, res_no_stream.text)
 
 
 @pytest.mark.asyncio
@@ -242,7 +332,7 @@ async def test_stream_options(foscolo, server):
     foscolo.seek(0)
     final = False
     continuous = True
-    async with httpx.AsyncClient() as http_client:
+    async with httpx.AsyncClient(timeout=30) as http_client:
         files = {"file": foscolo}
         async with http_client.stream(
             "POST", url, headers=headers, data=data, files=files
